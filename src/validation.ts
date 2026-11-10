@@ -3,6 +3,8 @@ import catalog from "./catalog.json";
 export const CONSENT_VERSION = "2026-11-09";
 export const IP_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_BODY_BYTES = 16_384;
+export const MAX_BATCH_SCANS = 16;
+export const MAX_BATCH_BYTES = 65_536;
 
 export class ApiError extends Error {
 	constructor(
@@ -37,7 +39,7 @@ export function uuid(value: unknown): string {
 	return value;
 }
 
-export async function readJson(request: Request): Promise<unknown> {
+export async function readJson(request: Request, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
 	if (request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() !== "application/json")
 		throw new ApiError(415, "json_required");
 	if (request.headers.has("Content-Encoding")) throw new ApiError(415, "encoded_body_not_supported");
@@ -50,7 +52,7 @@ export async function readJson(request: Request): Promise<unknown> {
 			const { value, done } = await reader.read();
 			if (done) break;
 			size += value.byteLength;
-			if (size > MAX_BODY_BYTES) {
+			if (size > maxBytes) {
 				await reader.cancel();
 				throw new ApiError(413, "body_too_large");
 			}
@@ -163,6 +165,19 @@ export function queryInteger(url: URL, name: string, fallback: number, min = 0, 
 	if (raw === null) return fallback;
 	requireCondition(/^(0|[1-9]\d*)$/.test(raw), "invalid_query");
 	return integer(Number(raw), min, max);
+}
+
+export function scanBatchInput(input: unknown): Scan[] {
+	const value = object(input);
+	exactKeys(value, ["scans"]);
+	requireCondition(Array.isArray(value.scans) && value.scans.length > 0 &&
+		value.scans.length <= MAX_BATCH_SCANS, "invalid_batch_size");
+	const scans = value.scans.map(scanInput);
+	requireCondition(scans.every((scan) => scan.mode === scans[0].mode &&
+		scan.sourcePostId === scans[0].sourcePostId), "mixed_batch_outpost");
+	requireCondition(new Set(scans.map((scan) => scan.scanId)).size === scans.length &&
+		new Set(scans.map((scan) => scan.productId)).size === scans.length, "duplicate_batch_good");
+	return scans;
 }
 
 export { catalog };

@@ -1,10 +1,10 @@
 import {
 	ApiError, CONSENT_VERSION, catalog, exactKeys, object,
-	queryInteger, readJson, requireCondition, scanInput, uuid,
+	queryInteger, readJson, requireCondition, scanInput, scanBatchInput, MAX_BATCH_BYTES, uuid,
 } from "./validation";
 import {
 	authenticate, bearer, cleanup, hash, PUBLIC_SCAN_COLUMNS, publicRows,
-	rateLimit, secret, storeScan, type BackendEnv,
+	rateLimit, secret, storeScan, storeScanBatch, type BackendEnv,
 } from "./storage";
 
 const METHODS: Record<string, string> = {
@@ -14,6 +14,7 @@ const METHODS: Record<string, string> = {
 	"/v1/installations": "POST",
 	"/v1/scan-tickets": "POST",
 	"/v1/scans": "POST",
+	"/v1/scan-batches": "POST",
 	"/v1/sync": "GET",
 	"/v1/latest": "GET",
 	"/v1/history": "GET",
@@ -113,9 +114,17 @@ async function route(request: Request, env: BackendEnv): Promise<Response> {
 		exactKeys(input, ["installationId"]);
 		return revoke(db, uuid(input.installationId), now);
 	}
-	if (["/v1/scan-tickets", "/v1/scans", "/v1/installation"].includes(url.pathname)) {
+	if (["/v1/scan-tickets", "/v1/scans", "/v1/scan-batches", "/v1/installation"].includes(url.pathname)) {
 		const installationId = await authenticate(request, db);
 		if (url.pathname === "/v1/installation") return revoke(db, installationId, now);
+		if (url.pathname === "/v1/scan-batches") {
+			const scans = scanBatchInput(await readJson(request, MAX_BATCH_BYTES));
+			await rateLimit(db, `write:${installationId}`, 60, 60_000, now, scans.length);
+			// Batching saves requests, not per-good validation or the observation allowance.
+			const receipts = await storeScanBatch(db, installationId, scans, ip, Date.now());
+			return json({ receipts: receipts.map((receipt, index) => ({ scanId: scans[index].scanId, ...receipt })) },
+				receipts.every((receipt) => receipt.duplicate) ? 200 : 201);
+		}
 		await rateLimit(db, `write:${installationId}`, 60, 60_000, now);
 		if (url.pathname === "/v1/scan-tickets") {
 			const input = object(await readJson(request));

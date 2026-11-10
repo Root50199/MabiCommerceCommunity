@@ -1,8 +1,8 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
-import { cleanup, hash, rateLimit } from "../src/storage";
-import { catalog, CONSENT_VERSION, IP_RETENTION_MS, MAX_BODY_BYTES, type Scan } from "../src/validation";
+import { cleanup, hash, rateLimit, storeScanBatch } from "../src/storage";
+import { catalog, CONSENT_VERSION, IP_RETENTION_MS, MAX_BODY_BYTES, MAX_BATCH_BYTES, type Scan } from "../src/validation";
 
 interface Installation {
 	installationId: string;
@@ -87,6 +87,137 @@ beforeEach(async () => {
 });
 
 describe("Reviewed observations and versioned provenance", () => {
+	it("keeps a maximal batch within the free-tier database query budget", async () => {
+		const installation = await register();
+		const template = await scanFor(installation.token);
+		let prepared = 0;
+		const session = env.DB.withSession("first-primary");
+		const db = new Proxy(session, {
+			get(target, key) {
+				if (key === "prepare") return (sql: string) => { prepared++; return target.prepare(sql); };
+				const value = Reflect.get(target, key);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const scans = Array.from({ length: 16 }, () => ({ ...template, scanId: crypto.randomUUID() }));
+		const receipts = await storeScanBatch(db, installation.installationId, scans, "127.0.0.1", Date.now());
+		expect(receipts).toHaveLength(16);
+		expect(prepared).toBeLessThanOrEqual(35); // Leaves room for authentication, rate limiting and cleanup.
+	});
+
+	it("rolls back all new goods if a conflicting ID races the precheck", async () => {
+		const installation = await register();
+		const template = await scanFor(installation.token);
+		const scans = [0, 1].map(() => ({ ...template, scanId: crypto.randomUUID() }));
+		const session = env.DB.withSession("first-primary");
+		const db = new Proxy(session, {
+			get(target, key) {
+				if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+					await env.DB.prepare(`INSERT INTO scans(id, installation_id, received_at, payload_hash,
+						mode, product_id, source_post_id, source_price, stock)
+						VALUES (?, ?, ?, 'different-payload', ?, ?, ?, ?, ?)`)
+						.bind(scans[1].scanId, installation.installationId, Date.now(), template.mode,
+							template.productId, template.sourcePostId, template.sourcePrice, template.stock).run();
+					return target.batch(statements);
+				};
+				const value = Reflect.get(target, key);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		await expect(storeScanBatch(db, installation.installationId, scans, "127.0.0.1", Date.now()))
+			.rejects.toMatchObject({ status: 409, code: "scan_conflict" });
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans").first("n")).toBe(1);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans WHERE id = ?").bind(scans[0].scanId).first("n")).toBe(0);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM quotes").first("n")).toBe(0);
+	});
+
+	it("accepts a whole outpost in one authenticated request without per-scan tickets and deduplicates retries", async () => {
+		const installation = await register();
+		const template = await scanFor(installation.token);
+		await env.DB.prepare("DELETE FROM scan_tickets").run();
+		const products = catalog.products.filter((p) => p.mode === template.mode && p.postId === template.sourcePostId);
+		const scans = products.map((p) => ({ ...template, scanId: crypto.randomUUID(), productId: p.id }));
+		const response = await request("/v1/scan-batches", "POST", { scans }, installation.token);
+		expect(response.status).toBe(201);
+		const body = await response.json<{ receipts: (Stored & { scanId: string })[] }>();
+		expect(body.receipts).toHaveLength(scans.length);
+		expect(body.receipts.map((r) => r.scanId)).toEqual(scans.map((s) => s.scanId));
+		expect(body.receipts.every((r) => !r.duplicate)).toBe(true);
+		const retry = await request("/v1/scan-batches", "POST", { scans }, installation.token);
+		expect(retry.status).toBe(200);
+		const repeated = await retry.json<typeof body>();
+		expect(repeated.receipts.map((r) => r.sequence)).toEqual(body.receipts.map((r) => r.sequence));
+		expect(repeated.receipts.every((r) => r.duplicate)).toBe(true);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans").first("n")).toBe(scans.length);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scan_tickets").first("n")).toBe(0);
+		const latest = await (await request("/v1/latest")).json<{ observations: Observation[] }>();
+		expect(latest.observations).toHaveLength(scans.length);
+	});
+
+	it("validates every batch good before writing and keeps authentication, bounds and conflicts explicit", async () => {
+		const installation = await register();
+		const scan = await scanFor(installation.token);
+		scan.scanId = crypto.randomUUID();
+		const other = catalog.products.find((p) => p.mode === scan.mode && p.postId === scan.sourcePostId && p.id !== scan.productId)!;
+		const second = { ...scan, scanId: crypto.randomUUID(), productId: other.id };
+		const invalid = { ...second, prices: second.prices.map((p, index) => ({ ...p, profit: index === 0 ? 999 : p.profit })) };
+		expect((await request("/v1/scan-batches", "POST", { scans: [scan, invalid] }, installation.token)).status).toBe(400);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans").first("n")).toBe(0);
+		for (const scans of [[], [scan, scan], Array.from({ length: 17 }, () => scan),
+			[scan, { ...second, mode: "barter" }]]) {
+			expect((await request("/v1/scan-batches", "POST", { scans }, installation.token)).status).toBe(400);
+		}
+		expect((await request("/v1/scan-batches", "POST", { scans: [scan] })).status).toBe(401);
+		expect((await request("/v1/scan-batches", "POST", { scans: [scan] }, installation.token)).status).toBe(201);
+		expect((await request("/v1/scan-batches", "POST", { scans: [{ ...scan, stock: 99 }, second] }, installation.token)).status).toBe(409);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans").first("n")).toBe(1);
+		const another = await register();
+		expect((await request("/v1/scan-batches", "POST", { scans: [scan] }, another.token)).status).toBe(409);
+		await revoke(installation.installationId);
+		expect((await request("/v1/scan-batches", "POST", { scans: [second] }, installation.token)).status).toBe(401);
+	});
+
+	it("keeps normalized reviewed provenance and Barter semantics in batches", async () => {
+		const installation = await register();
+		for (const mode of ["trade", "group", "barter"] as const) {
+			const scan = await scanFor(installation.token, mode);
+			scan.scanId = crypto.randomUUID();
+			scan.priceBasis = "normalized-v1";
+			scan.observedSourcePrice = scan.sourcePrice;
+			scan.purchaseDiscountPercent = 0;
+			scan.review = { sourceManual: false, stockManual: true, manualPostIds: [scan.prices[0].postId] };
+			scan.prices[0].profit = null;
+			expect((await request("/v1/scan-batches", "POST", { scans: [scan] }, installation.token)).status).toBe(201);
+		}
+		const response = await SELF.fetch("http://localhost/v1/latest", { headers: { "X-Community-Format": "normalized-v2" } });
+		const body = await response.json<{ observations: (Observation & { review: Scan["review"] })[] }>();
+		expect(body.observations).toHaveLength(3);
+		expect(body.observations.every((scan) => scan.review?.stockManual && scan.prices[0].profit === null)).toBe(true);
+	});
+
+	it("bounds actual batch bytes and charges the existing write allowance per good", async () => {
+		const installation = await register();
+		const template = await scanFor(installation.token);
+		const products = catalog.products.filter(p => p.mode === template.mode && p.postId === template.sourcePostId);
+		const scans = products.map(p => ({ ...template, scanId: crypto.randomUUID(), productId: p.id }));
+		const large = await SELF.fetch("http://localhost/v1/scan-batches", {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${installation.token}` },
+			body: JSON.stringify({ scans }) + " ".repeat(MAX_BATCH_BYTES),
+		});
+		expect(large.status).toBe(413);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans").first("n")).toBe(0);
+		const key = `write:${installation.installationId}:${Math.floor(Date.now() / 60_000)}`;
+		await env.DB.prepare("UPDATE rate_limits SET count = ? WHERE key = ?").bind(60 - scans.length, key).run();
+		expect((await request("/v1/scan-batches", "POST", { scans }, installation.token)).status).toBe(201);
+		expect(await env.DB.prepare("SELECT count FROM rate_limits WHERE key = ?").bind(key).first("count")).toBe(60);
+		const throttled = await request("/v1/scan-batches", "POST",
+			{ scans: scans.map(scan => ({ ...scan, scanId: crypto.randomUUID() })) }, installation.token);
+		expect(throttled.status).toBe(429);
+		expect(Number(throttled.headers.get("Retry-After"))).toBeGreaterThan(0);
+		expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM scans").first("n")).toBe(scans.length);
+	});
+
 	it("stores reviewed edits, nullable observed profits and returns them only to v2 readers", async () => {
 		const installation = await register();
 		const automatic = await scanFor(installation.token);

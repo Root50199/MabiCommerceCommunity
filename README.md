@@ -7,7 +7,7 @@ NewLife community scan sharing. Separate from the desktop app.
 
 - Implemented: D1 migrations, consent-based installation registration, hashed
   private credentials, short-lived scan tickets, validated/deduplicated scan
-  ingestion, latest data, incremental sync, paginated individual history,
+  ingestion and bounded ticket-free outpost batches, latest data, incremental sync, paginated individual history,
   contribution totals, revocation, rate limits, and private-IP cleanup.
 - A production pilot was deployed on 2026-11-09 at
   `https://mabicommerce-community.mabi-projects.workers.dev`.
@@ -23,6 +23,9 @@ NewLife community scan sharing. Separate from the desktop app.
   remotely. Normalized-v2 readers receive reviewed-scan provenance; older public
   readers retain automatic-only compatibility. The owner confirmed real
   production scan upload and second-instance sync.
+- Batch rollout (2026-11-10): backward-compatible `/v1/scan-batches` deployed;
+  no schema migration or quota increase. Legacy desktop releases still work.
+  Desktop batching targets v0.2.3-beta.
 - `DEPLOYMENT_MODE=local` rejects non-loopback request hosts. The all-zero D1 ID
   is a local placeholder, not a production binding.
 - No accounts, character names, hardware fingerprints, screenshots, raw OCR
@@ -191,7 +194,7 @@ returned by `GET /v1/privacy` before any registration/scan IP log is written.
 ## API v1
 
 JSON bodies must use `Content-Type: application/json`, be at most **16,384 actual
-bytes**, and have exactly the documented fields. Encoded bodies are rejected.
+bytes** (**65,536** for scan batches), and have exactly the documented fields. Encoded bodies are rejected.
 Responses use `Cache-Control: no-store`; errors have `{ "error": "code" }`.
 Unexpected server errors also include an opaque `requestId` and return 500.
 No browser CORS access is enabled.
@@ -204,6 +207,7 @@ No browser CORS access is enabled.
 | POST | `/v1/installations` | Explicit consent; returns installation ID and credential |
 | POST | `/v1/scan-tickets` | Authenticated 60-second upload ticket |
 | POST | `/v1/scans` | Authenticated, complete observation upload |
+| POST | `/v1/scan-batches` | Authenticated, 1–16 complete observations from one outpost/mode |
 | DELETE | `/v1/installation` | Authenticated self-withdrawal/revocation |
 | GET | `/v1/latest` | Most recently received non-revoked scan per mode/product |
 | GET | `/v1/sync` | Incremental non-revoked observations in server order |
@@ -212,6 +216,27 @@ No browser CORS access is enabled.
 | POST | `/v1/admin/revoke` | Separate operator credential; revoke an installation |
 
 ### Register and upload
+
+Current desktop clients queue accepted structured scans in memory, replacing
+earlier scans of the same good. They submit `{ "scans": [<scan>, ...] }` to
+`POST /v1/scan-batches` with bearer authentication: after 60s idle, at four
+minutes, or when the active outpost roster is complete. Each scan uses a fresh
+client-generated UUID; no per-good tickets are needed. All normal catalog,
+source/profit, normalization, stock and review checks still apply. The complete
+batch is validated before its scans/quotes/logs commit in one transaction.
+Duplicate scan or product IDs and mixed modes/outposts are rejected.
+
+The response is `{ "receipts": [{ "scanId", "sequence", "receivedAt", "duplicate" }] }`,
+in submission order: 201 if any scan is new, otherwise 200. Exact same-ID/payload
+retries are idempotent; mismatches return 409. Clients retain failed batches in
+memory for manual retry only; OFF discards them and close/update asks first.
+Server receipt times are approximate observation times after batching, not
+capture timestamps. There is no queue persistence, image or raw OCR upload.
+The existing 60/minute installation write allowance is charged **per good** in
+a batch, preserving abuse limits while reducing Worker requests. Storage uses
+at most 35 statements for 16 goods, plus authentication/rate-limit/cleanup work,
+within the free-tier 50-query invocation limit. Roll out the
+backend before a batch-capable desktop; legacy endpoints below remain supported.
 
 1. Read/display privacy policy and obtain explicit opt-in.
 2. `POST /v1/installations`:
