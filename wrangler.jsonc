@@ -1,0 +1,46 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "mabicommerce-community",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-09",
+	"vars": {
+		"DEPLOYMENT_MODE": "local"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "mabicommerce-community",
+			"database_id": "00000000-0000-0000-0000-000000000000",
+			"migrations_dir": "migrations"
+		}
+	],
+	"triggers": {
+		"crons": ["*/15 * * * *"]
+	},
+	"observability": {
+		"enabled": false
+	},
+	"env": {
+		"production": {
+			"name": "mabicommerce-community",
+			"workers_dev": true,
+			"vars": {
+				"DEPLOYMENT_MODE": "production"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "mabicommercecommunity",
+					"database_id": "3c0cf509-84ec-42f9-8d9d-1325c7145471",
+					"migrations_dir": "migrations"
+				}
+			],
+			"triggers": {
+				"crons": ["*/15 * * * *"]
+			},
+			"observability": {
+				"enabled": false
+			}
+		}
+	}
+}

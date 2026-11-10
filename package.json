@@ -1,0 +1,25 @@
+{
+  "name": "mabicommerce-community",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Opt-in community scan sharing backend for MabiCommerce NewLife.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run",
+    "cf-typegen": "wrangler types",
+    "db:migrate": "wrangler d1 migrations apply DB --local",
+    "catalog:import": "node tools/import-catalog.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.3",
+    "@types/node": "^26.6.6",
+    "typescript": "^5.5.2",
+    "vitest": "~5.0.3",
+    "wrangler": "^4.159.0"
+  }
+}
