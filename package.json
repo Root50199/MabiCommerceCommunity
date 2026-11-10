@@ -2,6 +2,7 @@
   "name": "mabicommerce-community",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT",
   "description": "Opt-in community scan sharing backend for MabiCommerce NewLife.",
   "scripts": {
     "deploy": "wrangler deploy",

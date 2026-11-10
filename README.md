@@ -408,5 +408,16 @@ Keep Cloudflare API tokens and `ADMIN_TOKEN` in secret storage only.
 
 CI runs tests, type checking and a deployment dry run; pushing source does not
 deploy the Worker or migrate any production database. Review staged paths and
-secret-like values before each push. Keep this repository private unless the
-owner explicitly approves changing its visibility.
+secret-like values before each push. This source repository is public with owner
+approval; production data, local databases and credentials are not published.
+
+## License
+
+Original backend source and documentation are available under the
+[MIT License](LICENSE), copyright 2026 Root50199. Dependencies and generated
+Cloudflare runtime declarations retain their respective licenses and notices.
+Mabinogi and its game names/catalog identifiers belong to their respective
+owners; this license does not grant rights to third-party game content.
+
+`private: true` in package.json prevents accidental npm publication; it does not
+restrict GitHub source visibility or the MIT license.
